@@ -12,6 +12,7 @@ import vulkan_hpp;
 #include <memory>
 #include <optional>
 #include <string>
+#include <set>
 
 class HelloTriangleApplication {
 public:
@@ -24,8 +25,13 @@ public:
     std::unique_ptr<vk::raii::Context> context;
     std::unique_ptr<vk::raii::Instance> instance;
     std::unique_ptr<vk::raii::DebugUtilsMessengerEXT> debugMessenger;
+    std::unique_ptr<vk::raii::SurfaceKHR> surface;
+    vk::PhysicalDevice physicalDevice{VK_NULL_HANDLE};
+    // Logical device (using C API to avoid RAII constructor overload issues)
+    VkDevice device = VK_NULL_HANDLE;
+    std::optional<uint32_t> graphicsFamily;
+    std::optional<uint32_t> presentFamily;
 
-public:
     void run() {
         initVulkan();
         mainLoop();
@@ -47,6 +53,10 @@ private:
         if (!window) {
             throw std::runtime_error("Failed to create GLFW window");
         }
+
+        createSurface();
+        pickPhysicalDevice();
+        createLogicalDevice();
     }
 
     void createInstance() {
@@ -134,6 +144,14 @@ private:
         listPhysicalDevices();
     }
 
+    void createSurface() {
+        VkSurfaceKHR c_surface;
+        if (glfwCreateWindowSurface(static_cast<VkInstance>(static_cast<vk::Instance>(*instance)), window, nullptr, &c_surface) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create window surface!");
+        }
+        surface = std::make_unique<vk::raii::SurfaceKHR>(*instance, vk::SurfaceKHR(c_surface));
+    }
+
     void listPhysicalDevices() {
         try {
             vk::raii::PhysicalDevices physicalDevices(*instance);
@@ -144,6 +162,120 @@ private:
             }
         } catch (const std::exception &e) {
             std::cerr << "Failed to enumerate physical devices: " << e.what() << std::endl;
+        }
+    }
+
+    struct QueueFamilyIndices {
+        std::optional<uint32_t> graphicsFamily;
+        std::optional<uint32_t> presentFamily;
+
+        bool isComplete() {
+            return graphicsFamily.has_value() && presentFamily.has_value();
+        }
+    };
+
+    QueueFamilyIndices findQueueFamilies(vk::PhysicalDevice pd) {
+        QueueFamilyIndices indices;
+
+        auto queueFamilies = pd.getQueueFamilyProperties();
+        uint32_t i = 0;
+        for (const auto &qf : queueFamilies) {
+            if (qf.queueFlags & vk::QueueFlagBits::eGraphics) {
+                indices.graphicsFamily = i;
+            }
+
+            if (surface) {
+                VkBool32 presentSupport = VK_FALSE;
+                VkPhysicalDevice vkpd = static_cast<VkPhysicalDevice>(pd);
+                vk::SurfaceKHR surf = static_cast<vk::SurfaceKHR>(*surface);
+                VkSurfaceKHR vksurf = static_cast<VkSurfaceKHR>(surf);
+                vkGetPhysicalDeviceSurfaceSupportKHR(vkpd, i, vksurf, &presentSupport);
+                if (presentSupport == VK_TRUE) {
+                    indices.presentFamily = i;
+                }
+            }
+
+            if (indices.isComplete()) break;
+            ++i;
+        }
+
+        return indices;
+    }
+
+    bool isDeviceSuitable(vk::PhysicalDevice pd) {
+        auto indices = findQueueFamilies(pd);
+
+        // Check for swapchain extension support
+        // Enumerate device extensions using the C API because vulkan-hpp enumerate helpers
+        // aren't available in this configuration.
+        uint32_t extCount = 0;
+        VkPhysicalDevice vkpd = static_cast<VkPhysicalDevice>(pd);
+        vkEnumerateDeviceExtensionProperties(vkpd, nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> availableExtensions(extCount);
+        if (extCount > 0) {
+            vkEnumerateDeviceExtensionProperties(vkpd, nullptr, &extCount, availableExtensions.data());
+        }
+
+        bool swapchainSupported = false;
+        for (auto const &ext : availableExtensions) {
+            if (std::string(ext.extensionName) == VK_KHR_SWAPCHAIN_EXTENSION_NAME) {
+                swapchainSupported = true;
+                break;
+            }
+        }
+
+        return indices.isComplete() && swapchainSupported;
+    }
+
+    void pickPhysicalDevice() {
+        // Use RAII container to enumerate physical devices and obtain vk::PhysicalDevice handles
+        vk::raii::PhysicalDevices devices(*instance);
+        for (auto const &pd_raii : devices) {
+            vk::PhysicalDevice pd = static_cast<vk::PhysicalDevice>(pd_raii);
+            if (isDeviceSuitable(pd)) {
+                physicalDevice = pd;
+                break;
+            }
+        }
+
+        if (static_cast<VkPhysicalDevice>(physicalDevice) == VK_NULL_HANDLE) {
+            throw std::runtime_error("Failed to find a suitable GPU!");
+        }
+    }
+
+    void createLogicalDevice() {
+        auto indices = findQueueFamilies(physicalDevice);
+        graphicsFamily = indices.graphicsFamily;
+        presentFamily = indices.presentFamily;
+
+        std::set<uint32_t> uniqueQueueFamilies = {graphicsFamily.value(), presentFamily.value()};
+
+        float queuePriority = 1.0f;
+        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+        for (uint32_t queueFamily : uniqueQueueFamilies) {
+            VkDeviceQueueCreateInfo qi{};
+            qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            qi.queueFamilyIndex = queueFamily;
+            qi.queueCount = 1;
+            qi.pQueuePriorities = &queuePriority;
+            queueCreateInfos.push_back(qi);
+        }
+
+        VkPhysicalDeviceFeatures deviceFeatures{};
+
+        const char* deviceExtensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+
+        VkDeviceCreateInfo createInfo{};
+        createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
+        createInfo.enabledExtensionCount = 1;
+        createInfo.ppEnabledExtensionNames = deviceExtensions;
+        createInfo.pEnabledFeatures = &deviceFeatures;
+
+        VkResult res = vkCreateDevice(static_cast<VkPhysicalDevice>(physicalDevice), &createInfo, nullptr, &device);
+        if (res != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create logical device!");
         }
     }
 
@@ -166,6 +298,10 @@ private:
     void cleanup() {
         // Destroy Vulkan RAII objects in reverse order of creation
         debugMessenger.reset();
+        if (device != VK_NULL_HANDLE) {
+            vkDestroyDevice(device, nullptr);
+            device = VK_NULL_HANDLE;
+        }
         instance.reset();
         context.reset();
 
